@@ -1,10 +1,13 @@
 module Control.Concurrent.STM.RouteTable ( TRouteTable
                                          , newTRouteTable
                                          , insert
+                                         , toList
+                                         , fromList
                                          ) where
 
 import Control.Concurrent.STM (STM)
 import Control.Concurrent.STM.TVar (TVar, newTVar, readTVar, writeTVar)
+import Data.Foldable (traverse_)
 import Data.Functor (($>))
 import Data.IP
 import Data.IP.RouteTable (Routable(..))
@@ -15,7 +18,10 @@ data RouteEntry k a = Nil
 data TRouteTable k a = TRouteTable (TVar (RouteEntry k a))
 
 newTRouteTable :: Routable k => STM (TRouteTable k a)
-newTRouteTable = TRouteTable <$> newTVar Nil
+newTRouteTable = newBranch Nil
+
+newBranch :: Routable k => RouteEntry k a -> STM (TRouteTable k a)
+newBranch e = TRouteTable <$> newTVar e
 
 insert :: Routable k => TRouteTable k a -> AddrRange k -> a -> STM ()
 insert (TRouteTable var) r val = do e <- readTVar var
@@ -34,12 +40,50 @@ insert' e@(Branch r2 tb2 mval b1 b2) r1 val | r1 == r2 = return $ Just $ Branch 
                                                              return $ Just $ if isLeft r2 tb1
                                                                               then Branch r1 tb1 (Just val) b1' b2'
                                                                               else Branch r1 tb1 (Just val) b2' b1'
+                                            | otherwise = do b1' <- newTRouteTable
+                                                             b2' <- newTRouteTable
+                                                             let b = Branch r1 tb1 (Just val) b1' b2'
+                                                             Just <$> link b e
     where
       tb1 = keyToTestBit r1
 
+link :: Routable k => RouteEntry k a -> RouteEntry k a -> STM (RouteEntry k a)
+link s1@(Branch k1 _ _ _ _) s2@(Branch k2 _ _ _ _) = do b1 <- newBranch s1
+                                                        b2 <- newBranch s2
+                                                        pure $ if isLeft k1 tbg
+                                                                  then Branch kg tbg Nothing b1 b2
+                                                                  else Branch kg tbg Nothing b2 b1
+  where
+    kg = glue 0 k1 k2
+    tbg = keyToTestBit kg
+link _ _ = error "link"
+
+glue :: Routable k => Int -> AddrRange k -> AddrRange k -> AddrRange k
+glue n k1 k2
+  | addr k1 `masked` mk == addr k2 `masked` mk = glue (n + 1) k1 k2
+  | otherwise = makeAddrRange (addr k1) (n - 1)
+  where
+    mk = intToMask n
 
 keyToTestBit :: Routable k => AddrRange k -> k
 keyToTestBit = intToTBit . mlen
 
 isLeft :: Routable k => AddrRange k -> k -> Bool
 isLeft adr = isZero (addr adr)
+
+toList :: Routable k => TRouteTable k a -> STM [(AddrRange k,a)]
+toList (TRouteTable var) = do l <- f =<< readTVar var
+                              pure l
+  where
+    f Nil = pure []
+    f (Branch k _ Nothing lb rb) = do ll <- toList lb
+                                      rl <- toList rb
+                                      pure (ll ++ rl)
+    f (Branch k _ (Just val) lb rb) = do ll <- toList lb
+                                         rl <- toList rb
+                                         pure $ (k,val):(ll ++ rl)
+
+fromList :: Routable k => [(AddrRange k,a)] -> STM (TRouteTable k a)
+fromList xs = do t <- newTRouteTable
+                 traverse_ (uncurry (insert t)) xs
+                 pure t
