@@ -3,8 +3,11 @@ module Control.Concurrent.STM.RouteTable ( TRouteTable
                                          , insert
                                          , toList
                                          , fromList
+                                         , delete
+                                         , lookup
                                          ) where
 
+import Prelude hiding (lookup)
 import Control.Concurrent.STM (STM)
 import Control.Concurrent.STM.TVar (TVar, newTVar, readTVar, writeTVar)
 import Data.Foldable (traverse_)
@@ -87,3 +90,42 @@ fromList :: Routable k => [(AddrRange k,a)] -> STM (TRouteTable k a)
 fromList xs = do t <- newTRouteTable
                  traverse_ (uncurry (insert t)) xs
                  pure t
+
+delete :: Routable k => TRouteTable k a -> AddrRange k -> STM ()
+delete (TRouteTable var) range = do e <- readTVar var
+                                    r <- del e
+                                    case r of
+                                      Nothing -> pure ()
+                                      Just e' -> writeTVar var e'
+  where
+    del Nil = pure Nothing
+    del (Branch k2 tb2 v2 lb rb) | range == k2 = pure (Just $ Branch k2 tb2 Nothing lb rb)
+                                 | k2 >:> range && isLeft range tb2 = delete lb range $> Nothing
+                                 | k2 >:> range                     = delete rb range $> Nothing
+                                 | otherwise = pure Nothing
+
+node :: Routable k => AddrRange k -> k -> Maybe a -> TRouteTable k a -> TRouteTable k a -> STM (RouteEntry k a)
+node k tb v lt@(TRouteTable lvar) rt@(TRouteTable rvar) = do l <- readTVar lvar
+                                                             r <- readTVar rvar
+                                                             pure (node' v l r)
+  where
+    node' Nothing Nil r = r
+    node' Nothing l Nil = l
+    node' v l r = Branch k tb v lt rt
+
+lookup :: Routable k => TRouteTable k a -> AddrRange k -> STM (Maybe a)
+lookup rt r = search rt r Nothing
+
+search :: Routable k => TRouteTable k a -> AddrRange k -> Maybe a -> STM (Maybe a)
+search (TRouteTable var) r res = search' =<< readTVar var
+  where
+    search' Nil = pure res
+    search' (Branch k tb Nothing lb rb)
+            | k >:> r && isLeft r tb = search lb r res
+            | k >:> r                = search rb r res
+            | otherwise              = pure res
+    search' (Branch k tb val lb rb)
+            | k == r = pure val
+            | k >:> r && isLeft r tb = search lb r val
+            | k >:> r                = search rb r val
+            | otherwise              = pure res
